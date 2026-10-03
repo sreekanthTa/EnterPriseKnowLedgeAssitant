@@ -43,6 +43,15 @@ def load_pipeline(mtime: float):
     return module
 
 
+def format_history(messages: list[dict], max_turns: int = 6) -> str:
+    """Format the most recent turns for the retrieval/answer prompts."""
+    recent = messages[-max_turns * 2:]
+    return "\n".join(
+        f"{'User' if message['role'] == 'user' else 'Assistant'}: {message['content']}"
+        for message in recent
+    )
+
+
 def fmt(value):
     return "—" if value is None else value
 
@@ -110,6 +119,7 @@ def main() -> None:
         return
 
     question = question.strip()
+    conversation_history = format_history(st.session_state["messages"])
     st.session_state["messages"].append({"role": "user", "content": question})
 
     with st.chat_message("user"):
@@ -119,7 +129,9 @@ def main() -> None:
         try:
             with st.spinner("Retrieving relevant chunks..."):
                 results = pipeline.retrieve_relevant_chunks(
-                    question, top_k=top_k
+                    question,
+                    top_k=top_k,
+                    conversation_history=conversation_history,
                 )
         except Exception as exc:  # noqa: BLE001
             st.error("Retrieval failed.")
@@ -131,7 +143,10 @@ def main() -> None:
             with st.spinner("Generating answer..."):
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 future = executor.submit(
-                    pipeline.generate_answer, question, results
+                    pipeline.generate_answer,
+                    question,
+                    results,
+                    conversation_history,
                 )
                 try:
                     answer = future.result(timeout=ANSWER_TIMEOUT_SECONDS)

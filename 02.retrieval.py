@@ -98,9 +98,15 @@ class QueryReWrite(dspy.Signature):
         description="The user's original question"
     )
 
+    conversation_history: str = dspy.InputField(
+            description="The conversation history, if any"
+        )
+
     re_written_query: str = dspy.OutputField(
         description="A clearer and more specific search query"
     )
+
+    
 
 
 query_re_writer = dspy.Predict(QueryReWrite)
@@ -121,6 +127,10 @@ class AnswerQuestion(dspy.Signature):
 
     question: str = dspy.InputField(
         description="The user's original question"
+    )
+
+    conversation_history: str = dspy.InputField(
+        description="The conversation history, if any"
     )
 
     answer: str = dspy.OutputField(
@@ -400,7 +410,8 @@ def combine_results(
 
 def retrieve_relevant_chunks(
     query: str,
-    top_k: int = 5
+    top_k: int = 5,
+    conversation_history: str = ""
 ):
 
     # --------------------------------
@@ -409,7 +420,8 @@ def retrieve_relevant_chunks(
 
     with dspy.context(lm=lm):
         rewritten_result = query_re_writer(
-            query=query
+            query=query,
+            conversation_history=conversation_history
         )
 
     rewritten_query = (
@@ -466,7 +478,8 @@ def retrieve_relevant_chunks(
 
 def generate_answer(
     query: str,
-    results
+    results,
+    conversation_history: str = ""
 ):
 
     context = "\n\n".join(
@@ -477,7 +490,8 @@ def generate_answer(
     with dspy.context(lm=lm):
         response = answer_generator(
             context=context,
-            question=query
+            question=query,
+            conversation_history=conversation_history
         )
 
     return response.answer
@@ -500,7 +514,8 @@ answer_streamer = dspy.streamify(
 
 def stream_answer(
     query: str,
-    results
+    results,
+    conversation_history: str = ""
 ):
 
     context = "\n\n".join(
@@ -514,7 +529,8 @@ def stream_answer(
 
     for value in answer_streamer(
         context=context,
-        question=query
+        question=query,
+        conversation_history=conversation_history
     ):
 
         if isinstance(
