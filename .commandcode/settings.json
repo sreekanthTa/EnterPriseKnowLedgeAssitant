@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "powershell",
+      "Shell(taskkill /PID 17724 /T /F 2>&1; Write-Output \"--- remaining kernels ---\"; Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { $_.CommandLine -like '*ipykernel_launcher*' } | Select-Object ProcessId, ExecutablePath | Format-Table -AutoSize)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

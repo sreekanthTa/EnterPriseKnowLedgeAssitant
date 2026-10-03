@@ -1,0 +1,49 @@
+﻿uv : C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:15: DeprecationWarning: 
+`langchain-community` is being sunset and is no longer actively maintained. See 
+https://github.com/langchain-ai/langchain-community/issues/674 for details and migration guidance toward standalone 
+integration packages.
+At line:2 char:1
++ uv run python evaluation/evaluate_rag.py 2>&1 | Out-File -FilePath ev ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\sreek\...ation packages.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  from langchain_community.chat_models.vertexai import ChatVertexAI  # noqa: F401
+C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:37: DeprecationWarning: Importing faithfulness 
+from 'ragas.metrics' is deprecated and will be removed in v1.0. Please use 'ragas.metrics.collections' instead. 
+Example: from ragas.metrics.collections import faithfulness
+  from ragas.metrics import (
+C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:37: DeprecationWarning: Importing 
+answer_relevancy from 'ragas.metrics' is deprecated and will be removed in v1.0. Please use 
+'ragas.metrics.collections' instead. Example: from ragas.metrics.collections import answer_relevancy
+  from ragas.metrics import (
+C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:37: DeprecationWarning: Importing 
+context_precision from 'ragas.metrics' is deprecated and will be removed in v1.0. Please use 
+'ragas.metrics.collections' instead. Example: from ragas.metrics.collections import context_precision
+  from ragas.metrics import (
+C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:37: DeprecationWarning: Importing context_recall 
+from 'ragas.metrics' is deprecated and will be removed in v1.0. Please use 'ragas.metrics.collections' instead. 
+Example: from ragas.metrics.collections import context_recall
+  from ragas.metrics import (
+C:\Users\sreek\EnterPriseKnowLedgeAssitant\evaluation\evaluate_rag.py:188: DeprecationWarning: LangchainLLMWrapper is 
+deprecated and will be removed in a future version. Use llm_factory instead: from openai import OpenAI; from 
+ragas.llms import llm_factory; llm = llm_factory('gpt-4o-mini', client=OpenAI(api_key='...'))
+  llm = LangchainLLMWrapper(
+
+Re-written Query: Describe the attention mechanism used in neural network models, including its purpose and common variants.
+
+Re-written Query: Define queries, keys, and values in the context of data retrieval systems.
+
+Re-written Query: What are the benefits of attention mechanisms in deep learning models?
+
+========== DATASET ==========
+
+EvaluationDataset(features=['user_input', 'retrieved_contexts', 'response', 'reference'], len=3)
+
+========== RUNNING RAGAS ==========
+
+
+Evaluating:   0%|          | 0/12 [00:00<?, ?it/s]Exception raised in Job[0]: LLMDidNotFinishException(The LLM 
+generation was not completed. Please increase the max_tokens and try again.)
+
+Evaluating:   8%|8         | 1/12 [00:19<03:36, 19.72s/it]
