@@ -106,6 +106,20 @@ def main() -> None:
         st.exception(exc)
         st.stop()
 
+    with st.sidebar:
+        if st.button("Check system health", use_container_width=True):
+            with st.spinner("Checking system health..."):
+                health = pipeline.health_check()
+            st.write("Healthy" if health["ok"] else "Unhealthy")
+            for name, component in health.items():
+                if name == "ok":
+                    continue
+                label = "OK" if component["ok"] else "Failed"
+                st.caption(f"{name}: {label}")
+                if not component["ok"] and "error" in component:
+                    with st.expander(f"{name} details"):
+                        st.code(component["error"])
+
     st.session_state.setdefault("messages", [])
 
     for message in st.session_state["messages"]:
@@ -138,39 +152,44 @@ def main() -> None:
             st.exception(exc)
             st.stop()
 
-        answer = ""
-        try:
-            with st.spinner("Generating answer..."):
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(
-                    pipeline.generate_answer,
-                    question,
-                    results,
-                    conversation_history,
-                )
-                try:
-                    answer = future.result(timeout=ANSWER_TIMEOUT_SECONDS)
-                except concurrent.futures.TimeoutError:
-                    st.warning(
-                        "The language model did not respond within "
-                        f"{ANSWER_TIMEOUT_SECONDS}s. This is usually a temporary "
-                        "Groq API delay — please try again."
+        answer = getattr(results, "direct_response", "")
+        if not answer:
+            try:
+                with st.spinner("Generating answer..."):
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    future = executor.submit(
+                        pipeline.generate_answer,
+                        question,
+                        results,
+                        conversation_history,
                     )
-                finally:
-                    executor.shutdown(wait=False)
-        except Exception as exc:  # noqa: BLE001
-            st.error("Answer generation failed.")
-            st.exception(exc)
+                    try:
+                        answer = future.result(timeout=ANSWER_TIMEOUT_SECONDS)
+                    except concurrent.futures.TimeoutError:
+                        st.warning(
+                            "The language model did not respond within "
+                            f"{ANSWER_TIMEOUT_SECONDS}s. This is usually a temporary "
+                            "Groq API delay — please try again."
+                        )
+                    finally:
+                        executor.shutdown(wait=False)
+            except Exception as exc:  # noqa: BLE001
+                st.error("Answer generation failed.")
+                st.exception(exc)
 
         if not str(answer).strip():
             answer = "I could not generate an answer from the retrieved context."
         st.markdown(answer)
 
-        if show_sources:
+        if show_sources and results:
             render_sources(results)
 
     st.session_state["messages"].append(
-        {"role": "assistant", "content": answer, "sources": results}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": list(results),
+        }
     )
 
 

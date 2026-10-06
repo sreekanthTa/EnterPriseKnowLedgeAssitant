@@ -1,12 +1,8 @@
+import logging
 import os
 import sys
 import threading
-
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
+from pathlib import Path
 
 import dspy
 import dspy.streaming
@@ -18,53 +14,75 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
 
-# ============================================================
-# 1. ENVIRONMENT
-# ============================================================
-
-load_dotenv()
-
-PINECONE_API_KEY = os.getenv("pinecone_api_key")
-GROQ_API_KEY = os.getenv("groq_api_key")
-HF_TOKEN = os.getenv("hf_token")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
-# ============================================================
-# 2. PINECONE
-# ============================================================
+_BASE_DIR = Path(__file__).resolve().parent
+_DATA_PATH = _BASE_DIR / "data" / "Attntion.pdf"
+logger = logging.getLogger(__name__)
 
-pc = Pinecone(
-    api_key=PINECONE_API_KEY
-)
-
-index = pc.Index("attntion-384")
-
-
-# ============================================================
-# 3. DSPY + GROQ
-# ============================================================
-
-lm = dspy.LM(
-    "groq/qwen/qwen3.8-27b",
-    api_key=GROQ_API_KEY,
-    max_tokens=1024,
-    temperature=0,
-    timeout=45,
-    num_retries=1
-)
-
+lm = None
+index = None
+client = None
+bm25_retriever = None
+_pipeline_lock = threading.Lock()
 _configure_lock = threading.Lock()
+_bm25_lock = threading.Lock()
+
+PINECONE_API_KEY = None
+GROQ_API_KEY = None
+HF_TOKEN = None
+
+
+class RetrievalServiceError(RuntimeError):
+    pass
+
+
+class RetrievalResults(list):
+    def __init__(self, results=(), direct_response=""):
+        super().__init__(results)
+        self.direct_response = direct_response
+
+
+def _validate_query(query: str):
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+
+
+def _validate_top_k(top_k: int):
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 1:
+        raise ValueError("top_k must be a positive integer")
+
+
+def _validate_chunking(chunk_size: int, overlap: int):
+    if not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    if not isinstance(overlap, int) or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap must be an integer from 0 to chunk_size - 1")
+
+
+def _validate_environment():
+    missing = [
+        name
+        for name, value in (
+            ("pinecone_api_key", PINECONE_API_KEY),
+            ("groq_api_key", GROQ_API_KEY),
+            ("hf_token", HF_TOKEN),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variables: " + ", ".join(missing)
+        )
 
 
 def configure_dspy():
-    """Configure DSPy once, from whichever thread imports this module first.
-
-    DSPy only lets the thread that called ``dspy.configure`` call it again.
-    Streamlit reruns the script in a fresh thread each time (and re-executes
-    this module whenever the file changes invalidate ``st.cache_resource``),
-    so a second unconditional call raises ``RuntimeError``. Reading the global
-    settings is allowed from any thread, so skip the write when already set.
-    """
+    """Configure DSPy once, from whichever thread initializes the pipeline first."""
     if dspy.settings.lm is not None:
         return
 
@@ -73,37 +91,77 @@ def configure_dspy():
             return
 
         try:
-            dspy.configure(
-                lm=lm,
-                verbose=True
-            )
+            dspy.configure(lm=lm, verbose=True)
         except RuntimeError:
             if dspy.settings.lm is None:
                 raise
 
 
-configure_dspy()
+def initialize_pipeline():
+    """Initialize external clients and local retrieval data once."""
+    global PINECONE_API_KEY, GROQ_API_KEY, HF_TOKEN
+    global lm, index, client, bm25_retriever
+
+    if bm25_retriever is not None:
+        return
+
+    with _pipeline_lock:
+        if bm25_retriever is not None:
+            return
+
+        load_dotenv()
+        PINECONE_API_KEY = os.getenv("pinecone_api_key")
+        GROQ_API_KEY = os.getenv("groq_api_key")
+        HF_TOKEN = os.getenv("hf_token")
+        _validate_environment()
+
+        lm = dspy.LM(
+            "groq/qwen/qwen3.8-27b",
+            api_key=GROQ_API_KEY,
+            max_tokens=1024,
+            temperature=0,
+            timeout=45,
+            num_retries=1,
+        )
+        configure_dspy()
+        index = Pinecone(api_key=PINECONE_API_KEY).Index("attntion-384")
+        client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+
+        pdf_text = load_pdf()
+        chunks = create_chunks(pdf_text, chunk_size=1000, overlap=200)
+        docs = create_documents(chunks)
+        bm25_retriever = create_bm25_retriever(docs, k=5)
 
 
 class QueryReWrite(dspy.Signature):
     """
-    Rewrite the user's query for semantic retrieval.
+    Classify the message before retrieval.
 
-    Preserve the original meaning and important context.
-    Make the query clear, specific and focused.
-    Do not answer the question.
+    Use intent=document_question only when the message asks about the indexed
+    document or its attention mechanism. Use intent=direct_response for
+    greetings, thanks, casual conversation, or unrelated questions.
+    For direct_response, answer briefly and do not create a search query.
+    For document_question, do not answer; rewrite the query for retrieval.
     """
 
     query: str = dspy.InputField(
-        description="The user's original question"
+        description="The user's original message"
     )
 
     conversation_history: str = dspy.InputField(
-            description="The conversation history, if any"
-        )
+        description="The conversation history, if any"
+    )
+
+    intent: str = dspy.OutputField(
+        description="Exactly document_question or direct_response"
+    )
 
     re_written_query: str = dspy.OutputField(
-        description="A clearer and more specific search query"
+        description="A clearer search query, or empty for direct_response"
+    )
+
+    direct_response: str = dspy.OutputField(
+        description="A brief direct reply, or empty for document_question"
     )
 
     
@@ -141,22 +199,30 @@ class AnswerQuestion(dspy.Signature):
 answer_generator = dspy.Predict(AnswerQuestion)
 
 
+class HealthCheck(dspy.Signature):
+    prompt: str = dspy.InputField()
+    response: str = dspy.OutputField()
+
+
+health_checker = dspy.Predict(HealthCheck)
+
+
 # ============================================================
 # 4. HUGGING FACE EMBEDDING MODEL
 # ============================================================
 
-client = InferenceClient(
-    provider="hf-inference",
-    api_key=HF_TOKEN
-)
-
-
 def generate_embedding(text: str):
+    initialize_pipeline()
 
-    embedding = client.feature_extraction(
-        text,
-        model="BAAI/bge-small-en-v1.5"
-    )
+    try:
+        embedding = client.feature_extraction(
+            text,
+            model="BAAI/bge-small-en-v1.5"
+        )
+    except Exception as exc:
+        raise RetrievalServiceError(
+            "Hugging Face embedding request failed"
+        ) from exc
 
     return embedding.tolist()
 
@@ -167,9 +233,7 @@ def generate_embedding(text: str):
 
 def load_pdf():
 
-    reader = PdfReader(
-        "data/Attntion.pdf"
-    )
+    reader = PdfReader(_DATA_PATH)
 
     text = ""
 
@@ -192,6 +256,9 @@ def create_chunks(
     chunk_size: int = 1000,
     overlap: int = 200
 ):
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    _validate_chunking(chunk_size, overlap)
 
     words = text.split()
 
@@ -240,6 +307,7 @@ def create_bm25_retriever(
     docs,
     k: int = 5
 ):
+    _validate_top_k(k)
 
     retriever = BM25Retriever.from_documents(
         docs
@@ -249,24 +317,7 @@ def create_bm25_retriever(
 
     return retriever
 
-pdf_text = load_pdf()
 
-chunks = create_chunks(
-    pdf_text,
-    chunk_size=1000,
-    overlap=200
-)
-
-docs = create_documents(
-    chunks
-)
-
-bm25_retriever = create_bm25_retriever(
-    docs,
-    k=5
-)
-
- 
 # ============================================================
 # 8. GET KEYWORD RESULTS
 # ============================================================
@@ -274,12 +325,13 @@ def get_chunks_by_keywords(
     query: str,
     top_k: int = 5
 ):
+    _validate_query(query)
+    _validate_top_k(top_k)
+    initialize_pipeline()
 
-    bm25_retriever.k = top_k
-
-    results = bm25_retriever.invoke(
-        query
-    )
+    with _bm25_lock:
+        bm25_retriever.k = top_k
+        results = bm25_retriever.invoke(query)
 
     keyword_results = []
 
@@ -304,27 +356,42 @@ def get_chunks_by_similarity(
     query_embedding,
     top_k: int = 5
 ):
+    if not query_embedding:
+        raise ValueError("query_embedding must not be empty")
+    _validate_top_k(top_k)
+    initialize_pipeline()
 
     similarity_results = []
 
 
-    result = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
+    try:
+        result = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+    except Exception as exc:
+        raise RetrievalServiceError(
+            "Pinecone similarity search failed"
+        ) from exc
 
     for rank, match in enumerate(
             result.matches,
             start=1
         ):
+        metadata = match.metadata or {}
+        chunk = metadata.get("text") if isinstance(metadata, dict) else None
+        if not isinstance(chunk, str) or not chunk.strip():
+            continue
+        if not isinstance(match.id, str) or not match.id.strip():
+            continue
 
-            similarity_results.append({
-                "chunk_id": match.id,
-                "chunk": match.metadata["text"],
-                "similarity_score": match.score,
-                "rank": rank
-            })
+        similarity_results.append({
+            "chunk_id": match.id,
+            "chunk": chunk,
+            "similarity_score": match.score,
+            "rank": rank
+        })
 
     return similarity_results
 
@@ -338,6 +405,9 @@ def combine_results(
     top_k: int = 5,
     rrf_k: int = 60
 ):
+    _validate_top_k(top_k)
+    if not isinstance(rrf_k, int) or isinstance(rrf_k, bool) or rrf_k < 1:
+        raise ValueError("rrf_k must be a positive integer")
 
     combined = {}
 
@@ -405,7 +475,57 @@ def combine_results(
 
 
 # ============================================================
-# 11. COMPLETE RETRIEVAL
+# 11. HEALTH CHECK
+# ============================================================
+
+def health_check():
+    status = {}
+    try:
+        initialize_pipeline()
+    except Exception as exc:
+        status["initialization"] = {"ok": False, "error": str(exc)}
+        status["ok"] = False
+        return status
+
+    status["pdf"] = {
+        "ok": _DATA_PATH.is_file() and _DATA_PATH.stat().st_size > 0
+    }
+    status["bm25"] = {
+        "ok": bm25_retriever is not None
+    }
+
+    try:
+        index.describe_index_stats()
+        status["pinecone"] = {"ok": True}
+    except Exception as exc:
+        status["pinecone"] = {"ok": False, "error": str(exc)}
+
+    try:
+        embedding = client.feature_extraction(
+            "health check",
+            model="BAAI/bge-small-en-v1.5"
+        )
+        status["hugging_face"] = {"ok": embedding is not None}
+    except Exception as exc:
+        status["hugging_face"] = {"ok": False, "error": str(exc)}
+
+    try:
+        with dspy.context(lm=lm):
+            health_checker(prompt="Reply with OK")
+        status["groq"] = {"ok": True}
+    except Exception as exc:
+        status["groq"] = {"ok": False, "error": str(exc)}
+
+    status["ok"] = all(
+        component["ok"]
+        for name, component in status.items()
+        if name != "ok"
+    )
+    return status
+
+
+# ============================================================
+# 12. COMPLETE RETRIEVAL
 # ============================================================
 
 def retrieve_relevant_chunks(
@@ -413,25 +533,47 @@ def retrieve_relevant_chunks(
     top_k: int = 5,
     conversation_history: str = ""
 ):
+    _validate_query(query)
+    _validate_top_k(top_k)
+    if not isinstance(conversation_history, str):
+        raise ValueError("conversation_history must be a string")
+    initialize_pipeline()
 
     # --------------------------------
     # Step 1: Query rewriting
     # --------------------------------
 
-    with dspy.context(lm=lm):
-        rewritten_result = query_re_writer(
-            query=query,
-            conversation_history=conversation_history
+    try:
+        with dspy.context(lm=lm):
+            rewritten_result = query_re_writer(
+                query=query,
+                conversation_history=conversation_history
+            )
+    except Exception as exc:
+        raise RetrievalServiceError(
+            "Groq query rewriting request failed"
+        ) from exc
+
+    intent = str(getattr(rewritten_result, "intent", "")).strip().lower()
+    if intent == "direct_response":
+        direct_response = str(
+            getattr(rewritten_result, "direct_response", "")
+        ).strip()
+        if not direct_response:
+            raise RetrievalServiceError(
+                "Query rewrite returned an empty direct response"
+            )
+        return RetrievalResults(direct_response=direct_response)
+
+    if intent != "document_question":
+        raise RetrievalServiceError(
+            "Query rewrite returned an invalid intent"
         )
 
-    rewritten_query = (
-        rewritten_result.re_written_query
-    )
-
-    print(
-        "\nRe-written Query:",
-        rewritten_query
-    )
+    rewritten_query = str(
+        getattr(rewritten_result, "re_written_query", "")
+    ).strip()
+    _validate_query(rewritten_query)
 
     # --------------------------------
     # Step 2: Semantic search
@@ -469,7 +611,7 @@ def retrieve_relevant_chunks(
         keyword_results
     )
 
-    return results[:top_k]
+    return RetrievalResults(results[:top_k])
 
 
 # ============================================================
@@ -481,6 +623,12 @@ def generate_answer(
     results,
     conversation_history: str = ""
 ):
+    _validate_query(query)
+    if not isinstance(results, (list, tuple)):
+        raise ValueError("results must be a list or tuple")
+    if not isinstance(conversation_history, str):
+        raise ValueError("conversation_history must be a string")
+    initialize_pipeline()
 
     context = "\n\n".join(
         result["chunk"]
@@ -517,6 +665,12 @@ def stream_answer(
     results,
     conversation_history: str = ""
 ):
+    _validate_query(query)
+    if not isinstance(results, (list, tuple)):
+        raise ValueError("results must be a list or tuple")
+    if not isinstance(conversation_history, str):
+        raise ValueError("conversation_history must be a string")
+    initialize_pipeline()
 
     context = "\n\n".join(
         result["chunk"]
@@ -579,9 +733,9 @@ def main():
         results
     )
 
-    print("\n\n========== ANSWER ==========\n")
-
-    print(answer)
+    logging.basicConfig(level=logging.INFO)
+    logger.info("========== ANSWER ==========")
+    logger.info(answer)
 
  
  
