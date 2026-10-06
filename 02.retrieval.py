@@ -9,6 +9,7 @@ import dspy
 import dspy.streaming
 from dotenv import load_dotenv
 from nemoguardrails import LLMRails, RailsConfig
+from nemoguardrails.rails.llm.options import GenerationOptions, GenerationRailsOptions
 from huggingface_hub import InferenceClient
 from pinecone import Pinecone
 from pypdf import PdfReader
@@ -109,8 +110,20 @@ def check_message(message: str, role: str) -> str:
     if role not in {"user", "assistant"}:
         raise ValueError("role must be user or assistant")
 
+    options = GenerationOptions(
+        rails=GenerationRailsOptions(
+            input=["self check input"] if role == "user" else False,
+            output=["self check output"] if role == "assistant" else False,
+            retrieval=False,
+            dialog=False,
+            tool_input=False,
+            tool_output=False,
+        ),
+        llm_params={"max_tokens": 16, "temperature": 0},
+    )
     response = _load_guardrails().generate(
-        messages=[{"role": role, "content": message}]
+        messages=[{"role": role, "content": message}],
+        options=options,
     )
     return _guardrail_content(response)
 
