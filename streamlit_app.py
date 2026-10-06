@@ -14,16 +14,20 @@ from its file path and cached for the lifetime of the Streamlit session.
 
 from __future__ import annotations
 
-import concurrent.futures
 import importlib.util
+import logging
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
 RETRIEVAL_PATH = BASE_DIR / "02.retrieval.py"
 
-ANSWER_TIMEOUT_SECONDS = 60
+MODEL_TIMEOUT_SECONDS = 45
+MAX_QUERY_LENGTH = 2000
 
 
 @st.cache_resource(show_spinner="Loading retrieval pipeline...")
@@ -101,19 +105,20 @@ def main() -> None:
 
     with st.sidebar:
         if st.button("Check system health", use_container_width=True):
-            with st.spinner("Loading retrieval pipeline..."):
-                pipeline = load_pipeline(RETRIEVAL_PATH.stat().st_mtime)
-            with st.spinner("Checking system health..."):
-                health = pipeline.health_check()
-            st.write("Healthy" if health["ok"] else "Unhealthy")
-            for name, component in health.items():
-                if name == "ok":
-                    continue
-                label = "OK" if component["ok"] else "Failed"
-                st.caption(f"{name}: {label}")
-                if not component["ok"] and "error" in component:
-                    with st.expander(f"{name} details"):
-                        st.code(component["error"])
+            try:
+                with st.spinner("Loading retrieval pipeline..."):
+                    pipeline = load_pipeline(RETRIEVAL_PATH.stat().st_mtime)
+                with st.spinner("Checking system health..."):
+                    health = pipeline.health_check()
+                st.write("Healthy" if health["ok"] else "Unhealthy")
+                for name, component in health.items():
+                    if name == "ok":
+                        continue
+                    label = "OK" if component["ok"] else "Failed"
+                    st.caption(f"{name}: {label}")
+            except Exception:
+                logger.exception("Health check failed")
+                st.error("Health check failed. Check the server logs.")
 
     st.session_state.setdefault("messages", [])
 
@@ -128,6 +133,12 @@ def main() -> None:
         return
 
     question = question.strip()
+    if len(question) > MAX_QUERY_LENGTH:
+        st.error(
+            f"Please keep your question under {MAX_QUERY_LENGTH} characters."
+        )
+        return
+
     conversation_history = format_history(st.session_state["messages"])
     st.session_state["messages"].append({"role": "user", "content": question})
 
@@ -144,35 +155,25 @@ def main() -> None:
                     top_k=top_k,
                     conversation_history=conversation_history,
                 )
-        except Exception as exc:  # noqa: BLE001
-            st.error("Retrieval failed.")
-            st.exception(exc)
+        except Exception:
+            logger.exception("Retrieval failed")
+            st.error("Retrieval failed. Please try again.")
             st.stop()
 
         answer = getattr(results, "direct_response", "")
         if not answer:
             try:
-                with st.spinner("Generating answer..."):
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    future = executor.submit(
-                        pipeline.generate_answer,
+                with st.spinner(
+                    f"Generating answer (timeout: {MODEL_TIMEOUT_SECONDS}s)..."
+                ):
+                    answer = pipeline.generate_answer(
                         question,
                         results,
                         conversation_history,
                     )
-                    try:
-                        answer = future.result(timeout=ANSWER_TIMEOUT_SECONDS)
-                    except concurrent.futures.TimeoutError:
-                        st.warning(
-                            "The language model did not respond within "
-                            f"{ANSWER_TIMEOUT_SECONDS}s. This is usually a temporary "
-                            "Groq API delay — please try again."
-                        )
-                    finally:
-                        executor.shutdown(wait=False)
-            except Exception as exc:  # noqa: BLE001
-                st.error("Answer generation failed.")
-                st.exception(exc)
+            except Exception:
+                logger.exception("Answer generation failed")
+                st.error("Answer generation failed or timed out. Please try again.")
 
         if not str(answer).strip():
             answer = "I could not generate an answer from the retrieved context."

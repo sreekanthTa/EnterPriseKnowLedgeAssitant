@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -40,6 +41,8 @@ PINECONE_API_KEY = None
 GROQ_API_KEY = None
 HF_TOKEN = None
 GUARDRAIL_REFUSAL = "I'm sorry, I can't respond to that."
+MAX_QUERY_LENGTH = 2000
+MAX_CONVERSATION_HISTORY_LENGTH = 12000
 CASUAL_GREETING_RESPONSES = {
     "hi": "Hello! How can I help?",
     "hello": "Hello! How can I help?",
@@ -59,6 +62,29 @@ class RetrievalResults(list):
         self.direct_response = direct_response
 
 
+def _load_deployment_secrets():
+    load_dotenv()
+    try:
+        import streamlit as st
+
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+
+    for environment_name, secret_names in {
+        "GROQ_API_KEY": ("GROQ_API_KEY", "groq_api_key"),
+        "PINECONE_API_KEY": ("PINECONE_API_KEY", "pinecone_api_key"),
+        "HF_TOKEN": ("HF_TOKEN", "hf_token"),
+    }.items():
+        if os.getenv(environment_name):
+            continue
+        for secret_name in secret_names:
+            value = secrets.get(secret_name)
+            if value:
+                os.environ[environment_name] = str(value)
+                break
+
+
 def _guardrail_content(response) -> str:
     if isinstance(response, dict):
         return str(response.get("content", ""))
@@ -72,7 +98,7 @@ def _load_guardrails():
 
     with _guardrails_lock:
         if _guardrails is None:
-            load_dotenv()
+            _load_deployment_secrets()
             config = RailsConfig.from_path(str(_BASE_DIR / "guardrails"))
             _guardrails = LLMRails(config)
     return _guardrails
@@ -89,9 +115,40 @@ def check_message(message: str, role: str) -> str:
     return _guardrail_content(response)
 
 
+def _grounded_answer(answer: str, context: str) -> bool:
+    stop_words = {
+        "about", "after", "again", "also", "because", "being", "between",
+        "could", "does", "from", "have", "into", "more", "only", "other",
+        "should", "some", "than", "that", "their", "there", "these", "they",
+        "this", "through", "using", "what", "when", "where", "which", "with",
+        "would", "your",
+    }
+    normalize = lambda value: re.findall(r"[a-z0-9]+", value.lower())
+    answer_terms = {
+        word
+        for word in normalize(answer)
+        if len(word) >= 4 and word not in stop_words
+    }
+    context_terms = set(normalize(context))
+    return bool(answer_terms & context_terms)
+
+
 def _validate_query(query: str):
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a non-empty string")
+    if len(query) > MAX_QUERY_LENGTH:
+        raise ValueError(
+            f"query must not exceed {MAX_QUERY_LENGTH} characters"
+        )
+
+
+def _validate_conversation_history(conversation_history: str):
+    if not isinstance(conversation_history, str):
+        raise ValueError("conversation_history must be a string")
+    if len(conversation_history) > MAX_CONVERSATION_HISTORY_LENGTH:
+        raise ValueError(
+            "conversation_history exceeds the maximum allowed length"
+        )
 
 
 def _validate_top_k(top_k: int):
@@ -150,10 +207,10 @@ def initialize_pipeline():
         if bm25_retriever is not None:
             return
 
-        load_dotenv()
-        PINECONE_API_KEY = os.getenv("pinecone_api_key")
-        GROQ_API_KEY = os.getenv("groq_api_key")
-        HF_TOKEN = os.getenv("hf_token")
+        _load_deployment_secrets()
+        PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or os.getenv("pinecone_api_key")
+        GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
+        HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("hf_token")
         _validate_environment()
 
         lm = dspy.LM(
@@ -576,8 +633,7 @@ def retrieve_relevant_chunks(
 ):
     _validate_query(query)
     _validate_top_k(top_k)
-    if not isinstance(conversation_history, str):
-        raise ValueError("conversation_history must be a string")
+    _validate_conversation_history(conversation_history)
 
     direct_response = CASUAL_GREETING_RESPONSES.get(query.strip().lower())
     if direct_response:
@@ -679,8 +735,7 @@ def generate_answer(
     _validate_query(query)
     if not isinstance(results, (list, tuple)):
         raise ValueError("results must be a list or tuple")
-    if not isinstance(conversation_history, str):
-        raise ValueError("conversation_history must be a string")
+    _validate_conversation_history(conversation_history)
     initialize_pipeline()
 
     context = "\n\n".join(
@@ -696,6 +751,9 @@ def generate_answer(
         )
 
     answer = response.answer
+    if context.strip() and not _grounded_answer(answer, context):
+        return "I could not find that information in the retrieved context."
+
     try:
         output_check = check_message(answer, "assistant")
     except Exception as exc:
@@ -729,8 +787,7 @@ def stream_answer(
     _validate_query(query)
     if not isinstance(results, (list, tuple)):
         raise ValueError("results must be a list or tuple")
-    if not isinstance(conversation_history, str):
-        raise ValueError("conversation_history must be a string")
+    _validate_conversation_history(conversation_history)
     initialize_pipeline()
 
     context = "\n\n".join(

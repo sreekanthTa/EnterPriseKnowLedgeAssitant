@@ -5,6 +5,8 @@ models:
     api_key_env_var: GROQ_API_KEY
     parameters:
       base_url: https://api.groq.com/openai/v1
+      max_tokens: 16
+      temperature: 0
 
 prompts:
   - task: self_check_input

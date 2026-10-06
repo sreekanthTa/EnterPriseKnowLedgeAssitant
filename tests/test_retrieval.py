@@ -14,6 +14,26 @@ retrieval = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(retrieval)
 
 
+class DeploymentSecretTests(unittest.TestCase):
+    def test_streamlit_secrets_populate_environment(self):
+        fake_streamlit = SimpleNamespace(
+            secrets={
+                "GROQ_API_KEY": "groq-test",
+                "pinecone_api_key": "pinecone-test",
+                "hf_token": "hf-test",
+            }
+        )
+        with patch.dict("sys.modules", {"streamlit": fake_streamlit}), patch.dict(
+            "os.environ", {}, clear=True
+        ), patch.object(retrieval, "load_dotenv"):
+            retrieval._load_deployment_secrets()
+            self.assertEqual(retrieval.os.environ["GROQ_API_KEY"], "groq-test")
+            self.assertEqual(
+                retrieval.os.environ["PINECONE_API_KEY"], "pinecone-test"
+            )
+            self.assertEqual(retrieval.os.environ["HF_TOKEN"], "hf-test")
+
+
 class RetrievalValidationTests(unittest.TestCase):
     def test_empty_query_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -22,6 +42,14 @@ class RetrievalValidationTests(unittest.TestCase):
     def test_invalid_top_k_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             retrieval._validate_top_k(0)
+
+    def test_oversized_query_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "2000"):
+            retrieval._validate_query("x" * 2001)
+
+    def test_oversized_history_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "maximum"):
+            retrieval._validate_conversation_history("x" * 12001)
 
     def test_invalid_chunk_overlap_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "overlap"):
@@ -36,6 +64,24 @@ class RetrievalValidationTests(unittest.TestCase):
         self.assertEqual(
             chunks,
             ["one two three", "three four five", "five"],
+        )
+
+
+class GroundingTests(unittest.TestCase):
+    def test_supported_answer_is_grounded(self):
+        self.assertTrue(
+            retrieval._grounded_answer(
+                "Attention uses queries and keys.",
+                "Attention uses queries, keys, and values.",
+            )
+        )
+
+    def test_unrelated_answer_is_not_grounded(self):
+        self.assertFalse(
+            retrieval._grounded_answer(
+                "Paris is the capital of France.",
+                "Attention uses queries, keys, and values.",
+            )
         )
 
 
@@ -100,6 +146,37 @@ class DirectResponseTests(unittest.TestCase):
 
         self.assertEqual(results, [])
         self.assertEqual(results.direct_response, "Hello! How can I help?")
+
+
+class HealthApiTests(unittest.TestCase):
+    def test_liveness_is_available_without_dependencies(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "health_api", PROJECT_ROOT / "api.py"
+        )
+        health_api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(health_api)
+
+        response = health_api.liveness()
+
+        self.assertEqual(response, {"status": "ok"})
+
+    def test_readiness_returns_service_unavailable_when_unhealthy(self):
+        api_spec = importlib.util.spec_from_file_location(
+            "health_api", PROJECT_ROOT / "api.py"
+        )
+        health_api = importlib.util.module_from_spec(api_spec)
+        api_spec.loader.exec_module(health_api)
+
+        with patch.object(
+            health_api,
+            "load_pipeline_module",
+            return_value=SimpleNamespace(
+                health_check=lambda: {"ok": False, "pinecone": {"ok": False}}
+            ),
+        ):
+            response = health_api.readiness()
+
+        self.assertEqual(response.status_code, 503)
 
 
 class LazyImportTests(unittest.TestCase):
