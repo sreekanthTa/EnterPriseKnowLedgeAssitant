@@ -229,7 +229,7 @@ def initialize_pipeline():
         lm = dspy.LM(
             "groq/qwen/qwen3.8-27b",
             api_key=GROQ_API_KEY,
-            max_tokens=1024,
+            max_tokens=512,
             temperature=0,
             timeout=45,
             num_retries=1,
