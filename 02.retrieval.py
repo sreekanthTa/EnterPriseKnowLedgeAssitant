@@ -7,6 +7,7 @@ from pathlib import Path
 import dspy
 import dspy.streaming
 from dotenv import load_dotenv
+from nemoguardrails import LLMRails, RailsConfig
 from huggingface_hub import InferenceClient
 from pinecone import Pinecone
 from pypdf import PdfReader
@@ -32,10 +33,20 @@ bm25_retriever = None
 _pipeline_lock = threading.Lock()
 _configure_lock = threading.Lock()
 _bm25_lock = threading.Lock()
+_guardrails_lock = threading.Lock()
+_guardrails = None
 
 PINECONE_API_KEY = None
 GROQ_API_KEY = None
 HF_TOKEN = None
+GUARDRAIL_REFUSAL = "I'm sorry, I can't respond to that."
+CASUAL_GREETING_RESPONSES = {
+    "hi": "Hello! How can I help?",
+    "hello": "Hello! How can I help?",
+    "hey": "Hey! How can I help?",
+    "thanks": "You're welcome!",
+    "thank you": "You're welcome!",
+}
 
 
 class RetrievalServiceError(RuntimeError):
@@ -46,6 +57,36 @@ class RetrievalResults(list):
     def __init__(self, results=(), direct_response=""):
         super().__init__(results)
         self.direct_response = direct_response
+
+
+def _guardrail_content(response) -> str:
+    if isinstance(response, dict):
+        return str(response.get("content", ""))
+    return str(getattr(response, "content", ""))
+
+
+def _load_guardrails():
+    global _guardrails
+    if _guardrails is not None:
+        return _guardrails
+
+    with _guardrails_lock:
+        if _guardrails is None:
+            load_dotenv()
+            config = RailsConfig.from_path(str(_BASE_DIR / "guardrails"))
+            _guardrails = LLMRails(config)
+    return _guardrails
+
+
+def check_message(message: str, role: str) -> str:
+    _validate_query(message)
+    if role not in {"user", "assistant"}:
+        raise ValueError("role must be user or assistant")
+
+    response = _load_guardrails().generate(
+        messages=[{"role": role, "content": message}]
+    )
+    return _guardrail_content(response)
 
 
 def _validate_query(query: str):
@@ -537,6 +578,18 @@ def retrieve_relevant_chunks(
     _validate_top_k(top_k)
     if not isinstance(conversation_history, str):
         raise ValueError("conversation_history must be a string")
+
+    direct_response = CASUAL_GREETING_RESPONSES.get(query.strip().lower())
+    if direct_response:
+        return RetrievalResults(direct_response=direct_response)
+
+    try:
+        input_check = check_message(query, "user")
+    except Exception as exc:
+        raise RetrievalServiceError("Input safety check failed") from exc
+    if input_check.strip().lower() == GUARDRAIL_REFUSAL.lower():
+        return RetrievalResults(direct_response=GUARDRAIL_REFUSAL)
+
     initialize_pipeline()
 
     # --------------------------------
@@ -642,7 +695,15 @@ def generate_answer(
             conversation_history=conversation_history
         )
 
-    return response.answer
+    answer = response.answer
+    try:
+        output_check = check_message(answer, "assistant")
+    except Exception as exc:
+        raise RetrievalServiceError("Output safety check failed") from exc
+    if output_check.strip().lower() == GUARDRAIL_REFUSAL.lower():
+        return GUARDRAIL_REFUSAL
+
+    return answer
 
 
 # ============================================================

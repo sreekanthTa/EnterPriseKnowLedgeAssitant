@@ -99,15 +99,10 @@ def main() -> None:
             "Pinecone + BM25 → RRF → DSPy answer"
         )
 
-    try:
-        pipeline = load_pipeline(RETRIEVAL_PATH.stat().st_mtime)
-    except Exception as exc:  # noqa: BLE001
-        st.error("Failed to load the retrieval pipeline.")
-        st.exception(exc)
-        st.stop()
-
     with st.sidebar:
         if st.button("Check system health", use_container_width=True):
+            with st.spinner("Loading retrieval pipeline..."):
+                pipeline = load_pipeline(RETRIEVAL_PATH.stat().st_mtime)
             with st.spinner("Checking system health..."):
                 health = pipeline.health_check()
             st.write("Healthy" if health["ok"] else "Unhealthy")
@@ -141,6 +136,8 @@ def main() -> None:
 
     with st.chat_message("assistant"):
         try:
+            with st.spinner("Loading retrieval pipeline..."):
+                pipeline = load_pipeline(RETRIEVAL_PATH.stat().st_mtime)
             with st.spinner("Retrieving relevant chunks..."):
                 results = pipeline.retrieve_relevant_chunks(
                     question,
@@ -179,6 +176,7 @@ def main() -> None:
 
         if not str(answer).strip():
             answer = "I could not generate an answer from the retrieved context."
+
         st.markdown(answer)
 
         if show_sources and results:
