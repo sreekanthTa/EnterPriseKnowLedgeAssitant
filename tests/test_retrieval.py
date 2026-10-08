@@ -20,7 +20,6 @@ class DeploymentSecretTests(unittest.TestCase):
             secrets={
                 "GROQ_API_KEY": "groq-test",
                 "pinecone_api_key": "pinecone-test",
-                "hf_token": "hf-test",
             }
         )
         with patch.dict("sys.modules", {"streamlit": fake_streamlit}), patch.dict(
@@ -31,7 +30,6 @@ class DeploymentSecretTests(unittest.TestCase):
             self.assertEqual(
                 retrieval.os.environ["PINECONE_API_KEY"], "pinecone-test"
             )
-            self.assertEqual(retrieval.os.environ["HF_TOKEN"], "hf-test")
 
 
 class RetrievalValidationTests(unittest.TestCase):
@@ -182,7 +180,7 @@ class HealthApiTests(unittest.TestCase):
 class LazyImportTests(unittest.TestCase):
     def test_import_does_not_initialize_external_clients(self):
         self.assertIsNone(retrieval.index)
-        self.assertIsNone(retrieval.client)
+        self.assertIsNone(retrieval.embedding_model)
         self.assertIsNone(retrieval.bm25_retriever)
         self.assertIsNone(retrieval.lm)
 

@@ -10,11 +10,20 @@ import dspy.streaming
 from dotenv import load_dotenv
 from nemoguardrails import LLMRails, RailsConfig
 from nemoguardrails.rails.llm.options import GenerationOptions, GenerationRailsOptions
-from huggingface_hub import InferenceClient
 from pinecone import Pinecone
 from pypdf import PdfReader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
+
+load_dotenv()
+
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(*args, **kwargs):
+        def decorate(function):
+            return function
+        return decorate
 
 
 for _stream in (sys.stdout, sys.stderr):
@@ -30,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 lm = None
 index = None
-client = None
+embedding_model = None
 bm25_retriever = None
 _pipeline_lock = threading.Lock()
 _configure_lock = threading.Lock()
@@ -40,7 +49,6 @@ _guardrails = None
 
 PINECONE_API_KEY = None
 GROQ_API_KEY = None
-HF_TOKEN = None
 GUARDRAIL_REFUSAL = "I'm sorry, I can't respond to that."
 MAX_QUERY_LENGTH = 2000
 MAX_CONVERSATION_HISTORY_LENGTH = 12000
@@ -72,15 +80,24 @@ def _load_deployment_secrets():
     except Exception:
         secrets = {}
 
+    if not os.getenv("LANGSMITH_TRACING_V2") and os.getenv("LANGSMITH_TRACING"):
+        os.environ["LANGSMITH_TRACING_V2"] = os.environ["LANGSMITH_TRACING"]
+
     for environment_name, secret_names in {
         "GROQ_API_KEY": ("GROQ_API_KEY", "groq_api_key"),
         "PINECONE_API_KEY": ("PINECONE_API_KEY", "pinecone_api_key"),
-        "HF_TOKEN": ("HF_TOKEN", "hf_token"),
+        "LANGSMITH_TRACING_V2": ("LANGSMITH_TRACING_V2",),
+        "LANGSMITH_API_KEY": ("LANGSMITH_API_KEY",),
+        "LANGSMITH_PROJECT": ("LANGSMITH_PROJECT",),
+        "LANGSMITH_ENDPOINT": ("LANGSMITH_ENDPOINT",),
     }.items():
         if os.getenv(environment_name):
             continue
         for secret_name in secret_names:
-            value = secrets.get(secret_name)
+            try:
+                value = secrets.get(secret_name)
+            except Exception:
+                value = None
             if value:
                 os.environ[environment_name] = str(value)
                 break
@@ -105,6 +122,7 @@ def _load_guardrails():
     return _guardrails
 
 
+@traceable(name="guardrail-check", run_type="chain")
 def check_message(message: str, role: str) -> str:
     _validate_query(message)
     if role not in {"user", "assistant"}:
@@ -182,7 +200,6 @@ def _validate_environment():
         for name, value in (
             ("pinecone_api_key", PINECONE_API_KEY),
             ("groq_api_key", GROQ_API_KEY),
-            ("hf_token", HF_TOKEN),
         )
         if not value
     ]
@@ -210,8 +227,8 @@ def configure_dspy():
 
 def initialize_pipeline():
     """Initialize external clients and local retrieval data once."""
-    global PINECONE_API_KEY, GROQ_API_KEY, HF_TOKEN
-    global lm, index, client, bm25_retriever
+    global PINECONE_API_KEY, GROQ_API_KEY
+    global lm, index, embedding_model, bm25_retriever
 
     if bm25_retriever is not None:
         return
@@ -223,7 +240,6 @@ def initialize_pipeline():
         _load_deployment_secrets()
         PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or os.getenv("pinecone_api_key")
         GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("groq_api_key")
-        HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("hf_token")
         _validate_environment()
 
         lm = dspy.LM(
@@ -235,8 +251,10 @@ def initialize_pipeline():
             num_retries=1,
         )
         configure_dspy()
+        from fastembed import TextEmbedding
+
         index = Pinecone(api_key=PINECONE_API_KEY).Index("attntion-384")
-        client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+        embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")
 
         pdf_text = load_pdf()
         chunks = create_chunks(pdf_text, chunk_size=1000, overlap=200)
@@ -319,20 +337,17 @@ health_checker = dspy.Predict(HealthCheck)
 
 
 # ============================================================
-# 4. HUGGING FACE EMBEDDING MODEL
+# 4. LOCAL EMBEDDING MODEL
 # ============================================================
 
 def generate_embedding(text: str):
     initialize_pipeline()
 
     try:
-        embedding = client.feature_extraction(
-            text,
-            model="BAAI/bge-small-en-v1.5"
-        )
+        embedding = next(embedding_model.embed([text]))
     except Exception as exc:
         raise RetrievalServiceError(
-            "Hugging Face embedding request failed"
+            "Local embedding generation failed"
         ) from exc
 
     return embedding.tolist()
@@ -612,13 +627,10 @@ def health_check():
         status["pinecone"] = {"ok": False, "error": str(exc)}
 
     try:
-        embedding = client.feature_extraction(
-            "health check",
-            model="BAAI/bge-small-en-v1.5"
-        )
-        status["hugging_face"] = {"ok": embedding is not None}
+        embedding = next(embedding_model.embed(["health check"]))
+        status["local_embeddings"] = {"ok": embedding is not None}
     except Exception as exc:
-        status["hugging_face"] = {"ok": False, "error": str(exc)}
+        status["local_embeddings"] = {"ok": False, "error": str(exc)}
 
     try:
         with dspy.context(lm=lm):
@@ -639,6 +651,7 @@ def health_check():
 # 12. COMPLETE RETRIEVAL
 # ============================================================
 
+@traceable(name="hybrid-retrieval", run_type="chain")
 def retrieve_relevant_chunks(
     query: str,
     top_k: int = 5,
@@ -740,6 +753,7 @@ def retrieve_relevant_chunks(
 # 12. GENERATE ANSWER
 # ============================================================
 
+@traceable(name="grounded-answer-generation", run_type="chain")
 def generate_answer(
     query: str,
     results,
